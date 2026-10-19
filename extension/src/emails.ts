@@ -52,7 +52,7 @@ async function getAppleMailMessages(
         set cutoffDate to (current date) - ${Math.floor(Date.now() / 1000) - cutoffSeconds}
         set output to ""
         set messageCount to 0
-        
+
         repeat with i from 1 to 50
           try
             set m to message i of inb
@@ -60,21 +60,21 @@ async function getAppleMailMessages(
             if knownGuids contains msgId then exit repeat
             set msgDate to date received of m
             if msgDate < cutoffDate then exit repeat
-            
+
             set msgSubject to subject of m
             set msgSender to sender of m
-            
+
             -- Improved HTML content handling
             set htmlContent to ""
             set plainContent to ""
-            
+
             -- Get raw HTML source as the primary target
             try
               set htmlContent to source of m
             on error
               set htmlContent to ""
             end try
-            
+
             -- Always get plain content as fallback
             try
               set plainContent to content of m
@@ -83,7 +83,7 @@ async function getAppleMailMessages(
             end try
 
             set msgDateStr to msgDate as «class isot» as string
-            
+
             -- Need to ensure we preserve the exact content without line wrapping
             -- that could confuse quoted-printable encoding
             set output to output & msgId & "$break$" & msgSubject & "$break$" & msgSender & "$break$" & htmlContent & "$break$" & plainContent & "$break$" & msgDateStr & "$end$"
