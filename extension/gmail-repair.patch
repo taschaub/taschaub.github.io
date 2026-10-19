@@ -1,0 +1,207 @@
+--- a/src/gmail.ts
++++ b/src/gmail.ts
+@@ -20,6 +20,16 @@
+   description: "Connect your Google account to access 2FA codes",
+ });
+ 
++class GmailTokenError extends Error {
++  constructor(public readonly code: string, status: number) {
++    super(
++      code === "invalid_grant"
++        ? "Google authorization has expired or was revoked. Sign in to Gmail again."
++        : `Google could not renew authorization (${status}). Try again; your saved authorization has been kept.`
++    );
++  }
++}
++
+ function getClientId() {
+   const prefs = getPreferenceValues<Preferences>();
+   return prefs.gmailClientId || "";
+@@ -27,14 +37,17 @@
+ 
+ async function authorize(): Promise<void> {
+   const tokenSet = await client.getTokens();
+-  if (tokenSet?.accessToken) {
+-    if (tokenSet.refreshToken && tokenSet.isExpired()) {
+-      try {
+-        await client.setTokens(await refreshTokens(tokenSet.refreshToken));
+-      } catch (error) {
++  if (tokenSet?.accessToken && !tokenSet.isExpired()) {
++    return;
++  }
++  if (tokenSet?.refreshToken) {
++    try {
++      await client.setTokens(await refreshTokens(tokenSet.refreshToken));
++    } catch (error) {
++      if (error instanceof GmailTokenError && error.code === "invalid_grant") {
+         await client.removeTokens();
+-        throw new Error("Failed to refresh tokens");
+-      }
++      }
++      throw error;
+     }
+     return;
+   }
+@@ -43,6 +56,7 @@
+     endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+     clientId: getClientId(),
+     scope: "https://www.googleapis.com/auth/gmail.readonly",
++    extraParameters: { access_type: "offline", prompt: "consent" },
+   });
+   const { authorizationCode } = await client.authorize(authRequest);
+   await client.setTokens(await fetchTokens(authRequest, authorizationCode));
+@@ -52,7 +66,7 @@
+   const params = new URLSearchParams();
+   params.append("client_id", getClientId());
+   params.append("code", authCode);
+-  params.append("verifier", authRequest.codeVerifier);
++  params.append("code_verifier", authRequest.codeVerifier);
+   params.append("grant_type", "authorization_code");
+   params.append("redirect_uri", authRequest.redirectURI);
+ 
+@@ -64,8 +78,7 @@
+     },
+   });
+   if (!response.ok) {
+-    console.error("fetch tokens error:", await response.text());
+-    throw new Error(response.statusText);
++    throw new Error(`Google sign-in failed (${response.status}). Please try connecting the account again.`);
+   }
+   return await response.json();
+ }
+@@ -84,8 +97,8 @@
+     },
+   });
+   if (!response.ok) {
+-    console.error("refresh tokens error:", await response.text());
+-    throw new Error(response.statusText);
++    const body = await response.json().catch(() => ({}));
++    throw new GmailTokenError(typeof body.error === "string" ? body.error : "unknown_error", response.status);
+   }
+   const tokenResponse = await response.json();
+   tokenResponse.refresh_token = tokenResponse.refresh_token ?? refreshToken;
+@@ -104,7 +117,7 @@
+     access_token: tokens.accessToken,
+     refresh_token: tokens.refreshToken,
+     scope: tokens.scope,
+-    expiry_date: tokens.expiresIn,
++    expiry_date: tokens.expiresIn === undefined ? undefined : tokens.updatedAt.getTime() + tokens.expiresIn * 1000,
+   });
+ 
+   return gmailClient({ version: "v1", auth: oAuth2Client });
+--- /dev/null
++++ b/src/gmail.test.ts
+@@ -0,0 +1,113 @@
++import { getGmailMessages } from "./gmail";
++import fetch from "node-fetch";
++
++const mockGetTokens = jest.fn();
++const mockSetTokens = jest.fn();
++const mockRemoveTokens = jest.fn();
++const mockAuthorizationRequest = jest.fn();
++const mockAuthorize = jest.fn();
++const mockSetCredentials = jest.fn();
++
++jest.mock(
++  "@raycast/api",
++  () => ({
++    Icon: { Link: "link" },
++    getPreferenceValues: () => ({ gmailClientId: "test-client" }),
++    OAuth: {
++      RedirectMethod: { AppURI: "app-uri" },
++      PKCEClient: jest.fn().mockImplementation(() => ({
++        getTokens: (...args: unknown[]) => mockGetTokens(...args),
++        setTokens: (...args: unknown[]) => mockSetTokens(...args),
++        removeTokens: (...args: unknown[]) => mockRemoveTokens(...args),
++        authorizationRequest: (...args: unknown[]) => mockAuthorizationRequest(...args),
++        authorize: (...args: unknown[]) => mockAuthorize(...args),
++      })),
++    },
++  }),
++  { virtual: true }
++);
++jest.mock("@googleapis/gmail", () => ({
++  auth: { OAuth2: jest.fn().mockImplementation(() => ({ setCredentials: mockSetCredentials })) },
++  gmail: jest.fn(() => ({ users: { messages: { list: async () => ({ data: { messages: [] } }) } } })),
++}));
++jest.mock("node-fetch", () => ({ __esModule: true, default: jest.fn() }));
++jest.mock("./utils", () => ({ calculateLookBackMinutes: jest.fn(() => 10) }));
++
++const mockFetch = fetch as jest.MockedFunction<typeof fetch>;
++const tokens = (overrides = {}) => ({
++  accessToken: "access-token",
++  refreshToken: "refresh-token",
++  expiresIn: 3600,
++  updatedAt: new Date("2026-10-19T12:00:00Z"),
++  isExpired: () => false,
++  ...overrides,
++});
++
++beforeEach(() => {
++  jest.spyOn(console, "error").mockImplementation(() => undefined);
++  jest.clearAllMocks();
++  mockAuthorizationRequest.mockResolvedValue({ codeVerifier: "verifier", redirectURI: "com.raycast:/oauth" });
++  mockAuthorize.mockResolvedValue({ authorizationCode: "authorization-code" });
++});
++
++test("converts the Raycast token lifetime into Google's absolute expiration timestamp", async () => {
++  mockGetTokens.mockResolvedValue(tokens());
++  await getGmailMessages("all", new Date());
++  expect(mockSetCredentials).toHaveBeenCalledWith(
++    expect.objectContaining({
++      expiry_date: new Date("2026-10-19T13:00:00Z").getTime(),
++    })
++  );
++  expect(mockFetch).not.toHaveBeenCalled();
++});
++
++test("renews an expired token and keeps the existing refresh token if Google omits it", async () => {
++  mockGetTokens.mockResolvedValue(tokens({ isExpired: () => true }));
++  mockFetch.mockResolvedValue({
++    ok: true,
++    json: async () => ({ access_token: "new-access", expires_in: 3600 }),
++  } as never);
++  await getGmailMessages("all", new Date());
++  expect(mockSetTokens).toHaveBeenCalledWith(expect.objectContaining({ refresh_token: "refresh-token" }));
++  expect(mockRemoveTokens).not.toHaveBeenCalled();
++});
++
++test("retains saved authorization after temporary Google errors", async () => {
++  mockGetTokens.mockResolvedValue(tokens({ isExpired: () => true }));
++  mockFetch.mockResolvedValue({ ok: false, status: 503, json: async () => ({ error: "server_error" }) } as never);
++  await expect(getGmailMessages("all", new Date())).rejects.toThrow("saved authorization has been kept");
++  expect(mockRemoveTokens).not.toHaveBeenCalled();
++});
++
++test("retains saved authorization after network failures", async () => {
++  mockGetTokens.mockResolvedValue(tokens({ isExpired: () => true }));
++  mockFetch.mockRejectedValue(new Error("Network unavailable"));
++  await expect(getGmailMessages("all", new Date())).rejects.toThrow("Network unavailable");
++  expect(mockRemoveTokens).not.toHaveBeenCalled();
++});
++
++test("removes a revoked refresh token and explains how to reconnect", async () => {
++  mockGetTokens.mockResolvedValue(tokens({ isExpired: () => true }));
++  mockFetch.mockResolvedValue({ ok: false, status: 400, json: async () => ({ error: "invalid_grant" }) } as never);
++  await expect(getGmailMessages("all", new Date())).rejects.toThrow("Sign in to Gmail again");
++  expect(mockRemoveTokens).toHaveBeenCalledTimes(1);
++});
++
++test("starts PKCE sign-in for an expired access token without a refresh token", async () => {
++  mockGetTokens.mockResolvedValue(tokens({ isExpired: () => true, refreshToken: undefined }));
++  mockFetch.mockResolvedValue({ ok: true, json: async () => ({ access_token: "new-access" }) } as never);
++  await getGmailMessages("all", new Date());
++  expect(mockAuthorizationRequest).toHaveBeenCalledWith(
++    expect.objectContaining({
++      scope: "https://www.googleapis.com/auth/gmail.readonly",
++      extraParameters: { access_type: "offline", prompt: "consent" },
++    })
++  );
++  const body = new URLSearchParams(mockFetch.mock.calls[0][1]?.body as string);
++  expect(body.get("code_verifier")).toBe("verifier");
++  expect(body.has("verifier")).toBe(false);
++});
++
++afterEach(() => {
++  jest.restoreAllMocks();
++});
